@@ -1,0 +1,136 @@
+name: build-deploy-verify-mern-task-manager
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-stack-task-manageme
+  INSTANCE_ID: i-082e26fae07cce454
+  SECRETS_MANAGER_ID: deptic/MERN_STACK_TASK_MANAGEMENT_APPLICATION/secrets
+  CONTAINER_PORT: "4000"
+  PUBLIC_URL: http://13.205.89.68
+
+jobs:
+  build-push-deploy-verify:
+    name: Build, Push, Deploy (EC2 Docker), Verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js for client build diagnostics
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm install --no-audit --no-fund
+
+      - name: Client lint diagnostics (eslint)
+        working-directory: client
+        run: npm run lint || echo "::warning::eslint reported issues; continuing with build diagnostics"
+
+      - name: Client build diagnostics (vite build)
+        working-directory: client
+        run: |
+          npm run build
+          echo "--- client dist listing ---"
+          ls -R dist | head -n 50
+          test -f dist/index.html && echo "client dist/index.html OK"
+
+      - name: Repository layout diagnostics
+        run: |
+          echo "--- repo root ---"
+          ls -la
+          echo "--- server directory ---"
+          ls -la server || true
+          echo "--- dockerfile probe ---"
+          ls -la Dockerfile dockerfile server/Dockerfile 2>/dev/null || echo "no Dockerfile found in repository"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to AWS (static credentials)
+        run: |
+          aws sts get-caller-identity --region "$AWS_REGION"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY_HOST"
+        env:
+          ECR_REGISTRY_HOST: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+
+      - name: Compute image tags
+        id: image
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:$SHORT_SHA"
+          LATEST_IMAGE="$ECR_REPOSITORY_URI:latest"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "LATEST_IMAGE=$LATEST_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image (context = repository root, port 4000)
+        run: |
+          docker build \
+            -t "${{ steps.image.outputs.FULL_IMAGE }}" \
+            -t "${{ steps.image.outputs.LATEST_IMAGE }}" \
+            -f Dockerfile .
+
+      - name: Push Docker image to Amazon ECR
+        run: |
+          docker push "${{ steps.image.outputs.FULL_IMAGE }}"
+          docker push "${{ steps.image.outputs.LATEST_IMAGE }}"
+
+      - name: Deploy to EC2 instance via SSM send-command
+        run: |
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "set -e",
+              "export AWS_REGION=ap-south-1",
+              "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "export IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-stack-task-manageme:latest",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:4000 --name app -e PORT=4000 -e CLOUDINARY_CLIENT_API=$CLOUDINARY_CLIENT_API -e CLOUDINARY_CLIENT_SECRET=$CLOUDINARY_CLIENT_SECRET -e JWT_SECRET_KEY=$JWT_SECRET_KEY -e MONGO_URI=$MONGO_URI $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for SSM command completion
+        run: |
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text)
+          echo "SSM command status: $STATUS"
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
+            exit 1
+          fi
+
+      - name: Verify deployment health (HTTP 200 required)
+        run: |
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health.out -w "%{http_code}" "$PUBLIC_URL" || true)
+            echo "attempt $i -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Health check passed with HTTP 200"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed; last response body:"
+          cat /tmp/health.out || true
+          exit 1
