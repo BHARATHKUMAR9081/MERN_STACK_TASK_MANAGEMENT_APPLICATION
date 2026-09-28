@@ -12,7 +12,6 @@ env:
   IMAGE_TAG: ${{ github.sha }}
   INSTANCE_ID: i-019e6110cdb66b34e
   PUBLIC_URL: http://15.207.190.237
-  CONTAINER_PORT: "4000"
 
 jobs:
   build-and-deploy:
@@ -30,22 +29,27 @@ jobs:
       - name: Build client (Vite)
         working-directory: client
         run: |
-          npm ci || npm install
+          npm ci || npm install --legacy-peer-deps
           npm run build
 
       - name: Install server dependencies (diagnostic)
         working-directory: server
         run: |
-          npm ci || npm install
+          npm ci || npm install --legacy-peer-deps
 
       - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
         run: |
-          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
-          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
           aws sts get-caller-identity
 
       - name: Log in to Amazon ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
         run: |
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ECR_REGISTRY"
@@ -57,36 +61,43 @@ jobs:
           docker image ls
 
       - name: Push Docker image to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
         run: |
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
           docker push "$FULL_IMAGE:$IMAGE_TAG"
           docker push "$FULL_IMAGE:latest"
 
       - name: Deploy to EC2 via SSM
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
         run: |
-          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
-          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
-
           IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "export REGION=$AWS_DEFAULT_REGION",
+              "export ECR_REGISTRY=$ECR_REGISTRY",
+              "export IMAGE_URI=$IMAGE_URI",
+              "aws ecr get-login-password --region \$REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY",
+              "docker pull \$IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app \$IMAGE_URI"
             ]
           }
           SSMPARAMS
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
+            --region "$AWS_DEFAULT_REGION" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy MERN task manager app" \
+            --comment "Deploy MERN task manager app $IMAGE_URI" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
 
@@ -94,25 +105,26 @@ jobs:
           aws ssm wait command-executed \
             --instance-id "$INSTANCE_ID" \
             --command-id "$COMMAND_ID" \
-            --region "$AWS_REGION"
+            --region "$AWS_DEFAULT_REGION"
 
           aws ssm get-command-invocation \
             --instance-id "$INSTANCE_ID" \
             --command-id "$COMMAND_ID" \
-            --region "$AWS_REGION" \
+            --region "$AWS_DEFAULT_REGION" \
             --query "[Status,StandardOutputContent,StandardErrorContent]" \
             --output text
 
       - name: Health check
         run: |
-          for i in $(seq 1 15); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || echo "000")
-            echo "Attempt $i: HTTP $HTTP_CODE from $PUBLIC_URL"
+          set -e
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL" || echo "000")
+            echo "Attempt $i: HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed."
+              echo "Health check passed: $PUBLIC_URL returned 200"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed after retries."
+          echo "Health check failed: $PUBLIC_URL did not return HTTP 200"
           exit 1
